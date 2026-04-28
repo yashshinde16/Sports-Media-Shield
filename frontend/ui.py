@@ -390,7 +390,7 @@ elif "Ownership" in mode:
         with col2:
             if reg_file:
                 img = load_uploaded_image(reg_file)
-                st.image(bgr_to_rgb(img), caption="Asset Preview", width='stretch')
+                st.image(bgr_to_rgb(img), caption="Asset Preview", use_column_width=True)
 
         if reg_file and st.button("⛓️ Register Asset", type="primary"):
             img = load_uploaded_image(reg_file)
