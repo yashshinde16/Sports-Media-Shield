@@ -301,7 +301,7 @@ if "Manual" in mode:
 elif "Auto" in mode:
     from scanner import scan_url_list, get_demo_targets as _get_demo
     run_auto_scan = scan_url_list
-    DEMO_SCAN_URLS = [t.url if hasattr(t, "url") else str(t) for t in _get_demo(8)]
+    DEMO_SCAN_URLS = [t.source if hasattr(t, "source") else str(t) for t in _get_demo(8)]
     st.markdown("## 🤖 Automated Asset Scanner")
     st.markdown("Simulate scanning a batch of URLs for unauthorized use of a protected asset.")
 
@@ -338,37 +338,40 @@ elif "Auto" in mode:
         with st.spinner(f"Scanning {len(candidate_urls)} URLs..."):
             results = run_auto_scan(ref_img, candidate_urls, watermark_key=watermark_key)
 
-        if not results:
+        if not results or not results.records:
             st.warning("No results returned from scanner.")
             st.stop()
 
         st.success(f"Scan complete! {results.total} URLs analysed.")
 
-        # Summary metrics
-        violations = sum(1 for r in results if r.get("is_unauthorized", False))
-        avg_score = sum(r.get("final_score", 0) for r in results) / max(len(results), 1)
+        # Summary metrics — results is a ScanBatchReport; use .records for iteration
+        violations = sum(1 for r in results.records if r.is_unauthorized)
+        avg_score = sum(r.final_score for r in results.records) / max(results.total, 1)
         m1, m2, m3 = st.columns(3)
-        m1.metric("URLs Scanned", len(results))
+        m1.metric("URLs Scanned", results.total)
         m2.metric("⚠️ Violations", violations)
         m3.metric("Avg Similarity", f"{avg_score:.1%}")
 
         st.divider()
         st.markdown("### Results")
-        for r in sorted(results, key=lambda x: x.get("final_score", 0), reverse=True):
-            score = r.get("final_score", 0)
-            verdict = r.get("verdict", "N/A")
-            url = r.get("url", "Unknown")
+        for r in sorted(results.records, key=lambda x: x.final_score, reverse=True):
+            score = r.final_score
+            verdict = r.verdict
+            url = r.target
             color = verdict_color(verdict)
 
             with st.expander(f"{'🔴' if score > 0.65 else '🟡' if score > 0.45 else '🟢'} {url[:70]} — {score:.1%}"):
-                if "error" in r:
-                    st.error(r["error"])
+                if r.error:
+                    st.error(r.error)
                 else:
                     a, b, c = st.columns(3)
                     a.metric("Final Score", f"{score:.1%}")
-                    b.metric("pHash", f"{r.get('phash_similarity',0):.1%}")
-                    c.metric("Verdict", verdict.replace("_"," "))
-                    st.markdown(f"**ORB:** {r.get('orb_similarity',0):.1%}")
+                    b.metric("pHash", f"{r.phash_score:.1%}")
+                    c.metric("Verdict", verdict.replace("_", " "))
+                    st.markdown(f"**ORB:** {r.orb_score:.1%}")
+                    if r.flags:
+                        flag_html = " ".join(f'<span class="flag-chip">{f}</span>' for f in r.flags)
+                        st.markdown(f'<div>{flag_html}</div>', unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
