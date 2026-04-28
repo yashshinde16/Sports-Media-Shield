@@ -466,46 +466,22 @@ elif "Status" in mode:
     if st.button("🔄 Refresh Status"):
         st.rerun()
 
-    # ── DEBUG: show raw import attempt ─────────────────────────────────────
+    # ── Module Health ──────────────────────────────────────────────────────
     st.markdown("### 🔌 Module Health")
-    
-    st.write("🔍 Attempting import of `backend_cloud.integration`...")
-    st.write(f"🗂️ sys.path entries: `{sys.path[:5]}`")
-    
-    integration_path = BASE_DIR / "backend_cloud" / "integration.py"
-    st.write(f"📄 Expected file: `{integration_path}` — exists: `{integration_path.exists()}`")
-
     try:
-        import backend_cloud.integration as _bci
-        st.write(f"✅ Import succeeded. Functions: `{dir(_bci)}`")
-        
         from backend_cloud.integration import system_status
-        st.write("✅ `system_status` imported. Calling it...")
-        
         status = system_status()
-        st.write(f"✅ Returned: `{status}`")
-        st.write(f"   Type: `{type(status)}`, Empty: `{not status}`")
-
-        if not status:
-            st.warning("⚠️ system_status() returned empty — nothing to display")
-        else:
-            for module, state in status.items():
-                ok = "ok" in str(state).lower() or "configured" in str(state).lower()
-                icon = "✅" if ok else "❌"
-                st.markdown(f"{icon} **{module.upper()}**: `{state}`")
-
-    except ImportError as e:
-        st.error(f"❌ ImportError: {e}")
-        import traceback; st.code(traceback.format_exc())
+        for module, state in status.items():
+            ok = "ok" in str(state).lower() or "configured" in str(state).lower()
+            icon = "✅" if ok else "❌"
+            st.markdown(f"{icon} **{module.upper()}**: `{state}`")
     except Exception as e:
-        st.error(f"❌ Exception: {e}")
-        import traceback; st.code(traceback.format_exc())
+        st.error(f"Could not load system status: {e}")
 
-    # ── Env / API Keys check ───────────────────────────────────────────────
+    # ── Environment Variables ──────────────────────────────────────────────
     st.divider()
     st.markdown("### 🔑 Environment Variables")
-    env_vars = ["GEMINI_API_KEY", "FIREBASE_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS"]
-    for var in env_vars:
+    for var in ["GEMINI_API_KEY", "FIREBASE_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS"]:
         val = os.environ.get(var, "")
         if val:
             st.markdown(f"✅ `{var}` — set ({len(val)} chars)")
@@ -523,11 +499,8 @@ elif "Status" in mode:
                 st.markdown(f"- `{f['filename']}` ({f.get('size_bytes', 0)//1024}KB) — `{f['media_id'][:8]}…`")
         else:
             st.info("No files uploaded yet.")
-    except ImportError as e:
-        st.warning(f"⚠️ storage module not found: {e}")
     except Exception as e:
         st.warning(f"⚠️ Cannot list files: {e}")
-        import traceback; st.code(traceback.format_exc())
 
     # ── Firestore Records ──────────────────────────────────────────────────
     st.divider()
@@ -540,13 +513,13 @@ elif "Status" in mode:
         else:
             st.info("No Firestore records yet (using in-memory fallback).")
     except ImportError as e:
-     st.warning(f"⚠️ Firestore module not found: {e}")
-     records = []
+        st.warning(f"⚠️ Firestore module not found: {e}")
+        records = []
     except Exception as e:
-     st.warning("⚠️ Firestore unavailable — running in offline mode.")
-     records = []
+        st.warning("⚠️ Firestore unavailable — running in offline mode.")
+        records = []
 
-    # ── Upload dir check ───────────────────────────────────────────────────
+    # ── Upload Directory ───────────────────────────────────────────────────
     st.divider()
     st.markdown("### 🗂️ Upload Directory")
     if UPLOAD_DIR.exists():
