@@ -7,7 +7,7 @@ python-multipart==0.0.9
 streamlit==1.35.0
 
 # ── Computer Vision ────────────────────────────────────────────────────────
-opencv-python==4.9.0.80
+opencv-python-headless==4.9.0.80
 numpy==1.26.4
 Pillow==10.3.0
 imagehash==4.3.1
