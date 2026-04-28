@@ -342,7 +342,7 @@ elif "Auto" in mode:
             st.warning("No results returned from scanner.")
             st.stop()
 
-        st.success(f"Scan complete! {len(results)} URLs analysed.")
+        st.success(f"Scan complete! {results.total} URLs analysed.")
 
         # Summary metrics
         violations = sum(1 for r in results if r.get("is_unauthorized", False))
