@@ -471,32 +471,39 @@ elif "Status" in mode:
     if st.button("🔄 Refresh Status"):
         st.rerun()
 
-    # ── Module Status ──────────────────────────────────────────────────────
+    # ── DEBUG: show raw import attempt ─────────────────────────────────────
     st.markdown("### 🔌 Module Health")
     
-    modules_checked = False
-    try:
-        from backend_cloud.integration import system_status
-        status = system_status()
-        modules_checked = True
+    st.write("🔍 Attempting import of `backend_cloud.integration`...")
+    st.write(f"🗂️ sys.path entries: `{sys.path[:5]}`")
+    
+    integration_path = BASE_DIR / "backend_cloud" / "integration.py"
+    st.write(f"📄 Expected file: `{integration_path}` — exists: `{integration_path.exists()}`")
 
-        cols = st.columns(2)
-        for i, (module, state) in enumerate(status.items()):
-            ok = "ok" in str(state).lower() or "configured" in str(state).lower()
-            icon = "✅" if ok else "❌"
-            color = "#22c55e" if ok else "#ef4444"
-            with cols[i % 2]:
-                st.markdown(
-                    f'<div style="background:#0f0f23;border:1px solid #2d2d6b;border-radius:10px;'
-                    f'padding:0.8rem 1rem;margin-bottom:0.5rem;">'
-                    f'{icon} <b style="color:#e0e7ff">{module.upper()}</b><br>'
-                    f'<code style="color:{color}">{state}</code></div>',
-                    unsafe_allow_html=True
-                )
+    try:
+        import backend_cloud.integration as _bci
+        st.write(f"✅ Import succeeded. Functions: `{dir(_bci)}`")
+        
+        from backend_cloud.integration import system_status
+        st.write("✅ `system_status` imported. Calling it...")
+        
+        status = system_status()
+        st.write(f"✅ Returned: `{status}`")
+        st.write(f"   Type: `{type(status)}`, Empty: `{not status}`")
+
+        if not status:
+            st.warning("⚠️ system_status() returned empty — nothing to display")
+        else:
+            for module, state in status.items():
+                ok = "ok" in str(state).lower() or "configured" in str(state).lower()
+                icon = "✅" if ok else "❌"
+                st.markdown(f"{icon} **{module.upper()}**: `{state}`")
+
     except ImportError as e:
-        st.error(f"❌ Could not import `backend_cloud.integration`: {e}")
+        st.error(f"❌ ImportError: {e}")
+        import traceback; st.code(traceback.format_exc())
     except Exception as e:
-        st.error(f"❌ system_status() failed: {e}")
+        st.error(f"❌ Exception: {e}")
         import traceback; st.code(traceback.format_exc())
 
     # ── Env / API Keys check ───────────────────────────────────────────────
