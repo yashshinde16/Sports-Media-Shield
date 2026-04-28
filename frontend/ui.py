@@ -325,15 +325,24 @@ elif "Auto" in mode:
     if ref_file and st.button("🔍 Start Scan", type="primary"):
         ref_img = load_uploaded_image(ref_file)
 
-        if ref_img is None:
+        if ref_img is None or not isinstance(ref_img, np.ndarray) or ref_img.size == 0:
             st.error("❌ Could not load image. Please upload a valid JPG or PNG.")
-        else:
-            st.image(bgr_to_rgb(ref_img), caption="Reference Asset", width=300)
+            st.stop()
 
-            with st.spinner(f"Scanning {len(candidate_urls)} URLs..."):
-                results = run_auto_scan(ref_img, candidate_urls, watermark_key=watermark_key)
+        if not candidate_urls:
+            st.warning("⚠️ Please enter at least one URL to scan.")
+            st.stop()
 
-            st.success(f"Scan complete! {len(results)} URLs analysed.")
+        st.image(bgr_to_rgb(ref_img), caption="Reference Asset", width=300)
+
+        with st.spinner(f"Scanning {len(candidate_urls)} URLs..."):
+            results = run_auto_scan(ref_img, candidate_urls, watermark_key=watermark_key)
+
+        if not results:
+            st.warning("No results returned from scanner.")
+            st.stop()
+
+        st.success(f"Scan complete! {len(results)} URLs analysed.")
 
         # Summary metrics
         violations = sum(1 for r in results if r.get("is_unauthorized", False))
