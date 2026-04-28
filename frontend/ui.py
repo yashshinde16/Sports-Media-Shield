@@ -389,9 +389,9 @@ elif "Ownership" in mode:
         col1, col2 = st.columns([1, 1])
         with col1:
             reg_file = st.file_uploader("Asset Image", type=["jpg","jpeg","png"], key="reg_img")
-            reg_title = st.text_input("Asset Title", value="Championship Highlights 2024")
-            reg_owner = st.text_input("Owner Name", value=owner_name)
-            reg_key = st.text_input("🔑 Watermark Key", value="", type="password", placeholder="Enter secret key to embed watermark...", help="Remember this key — you need it to verify ownership later")
+            reg_title = st.text_input("Asset Title", value="Championship Highlights 2024", key="reg_title")
+            reg_owner = st.text_input("Owner Name", value=owner_name, key="reg_owner")
+            reg_key = st.text_input("🔑 Watermark Key", value="", type="password", placeholder="Enter secret key to embed watermark...", help="Remember this key — you need it to verify ownership later", key="reg_wm_key")
         with col2:
             if reg_file:
                 img = load_uploaded_image(reg_file)
