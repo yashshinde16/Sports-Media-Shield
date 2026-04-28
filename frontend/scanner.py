@@ -406,6 +406,17 @@ def scan_batch(
             norm.append(t)
 
     report = ScanBatchReport(total=len(norm))
+
+    # Guard: validate reference image before doing anything
+    if reference_img is None or not isinstance(reference_img, np.ndarray) or reference_img.size == 0:
+        raise ValueError(
+            "reference_img is None or invalid. "
+            "Ensure the uploaded image was loaded correctly before calling scan_batch()."
+        )
+
+    if len(reference_img.shape) < 2:
+        raise ValueError("reference_img has an invalid shape — must be at least 2D.")
+
     ref_resized = cv2.resize(reference_img, (512, 512), interpolation=cv2.INTER_AREA)
 
     def _process(idx: int, tgt: ScanTarget):
@@ -505,8 +516,8 @@ def simulate_live_scan(
 
 
 def scan_url_list(
-    urls: list,
     reference_img: np.ndarray,
+    urls: list,
     watermark_key: str = "",
     progress_cb: Optional[Callable] = None,
 ) -> ScanBatchReport:
