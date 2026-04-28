@@ -1,68 +1,87 @@
 """
-member3_firestore.py — Firebase Firestore Integration
-Team Member 3 | Part 2: Backend + Cloud
+firestore.py — Firestore / In-Memory Storage Layer
+Backend + Cloud
 
-Provides read/write helpers for:
-  - media_assets   (ownership + fingerprint registry)
-  - comparisons    (detection history)
-  - scan_results   (auto-scanner logs)
-
-Falls back to in-memory dict store when Firebase credentials are absent,
-so the system runs locally without any cloud setup.
+Authenticates via Streamlit secrets (service account JSON under [firebase]).
+Falls back to an in-memory dict if credentials are unavailable.
+All blocking Firestore calls are wrapped with a 5-second timeout so the
+app never hangs waiting for a dead connection.
 """
 
 import os
 import time
-import json
+import uuid
+import concurrent.futures
 from pathlib import Path
-from typing import Optional, Any
-from datetime import datetime
+from typing import Optional
 
-# ── Load .env first so keys are available ─────────────────────────────────────
+# ── Load .env (local dev only) ────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 except ImportError:
     pass
 
-# ── Firebase Initialisation ───────────────────────────────────────────────────
-# Reads FIREBASE_CREDENTIALS_PATH (from .env) OR GOOGLE_APPLICATION_CREDENTIALS.
-# Falls back to in-memory if neither is set.
-
-_db = None           # Firestore client (or None)
-_fallback: dict = {} # In-memory fallback: { collection: { doc_id: data } }
-
-CRED_PATH    = os.environ.get("FIREBASE_CREDENTIALS_PATH") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-PROJECT_ID   = os.environ.get("FIREBASE_PROJECT_ID", "")
-
+# ── Globals ───────────────────────────────────────────────────────────────────
+_db = None            # google.cloud.firestore.Client  (or None)
+_fallback: dict = {}  # { collection: { doc_id: data } }
 _USE_FIREBASE = False
 
+PROJECT_ID = os.environ.get("FIREBASE_PROJECT_ID", "")
+
+
+# ── Client factory ────────────────────────────────────────────────────────────
+
+def _get_client():
+    """
+    Build a Firestore client from Streamlit secrets (preferred on Streamlit Cloud)
+    or fall back to GOOGLE_APPLICATION_CREDENTIALS / ADC.
+    """
+    try:
+        import streamlit as st
+        from google.oauth2 import service_account
+        from google.cloud import firestore as _fs
+
+        if "firebase" in st.secrets:
+            creds_dict = dict(st.secrets["firebase"])
+            creds = service_account.Credentials.from_service_account_info(creds_dict)
+            project = creds_dict.get("project_id", PROJECT_ID)
+            return _fs.Client(credentials=creds, project=project)
+    except Exception:
+        pass  # Streamlit not available or secret missing — try ADC below
+
+    from google.cloud import firestore as _fs
+    return _fs.Client(project=PROJECT_ID or None)
+
+
+# ── Initialisation ────────────────────────────────────────────────────────────
 
 def _init_firebase():
     global _db, _USE_FIREBASE
     if _db is not None:
         return
-
     try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
-
-        if not firebase_admin._apps:
-            if CRED_PATH and Path(CRED_PATH).exists():
-                cred = credentials.Certificate(CRED_PATH)
-                firebase_admin.initialize_app(cred, {"projectId": PROJECT_ID or None})
-            elif PROJECT_ID:
-                # Application Default Credentials (GCP environment)
-                firebase_admin.initialize_app(options={"projectId": PROJECT_ID})
-            else:
-                print("[Firestore] No credentials found — using in-memory fallback")
-                return
-
-        _db = firestore.client()
+        _db = _get_client()
         _USE_FIREBASE = True
-        print("[Firestore] Connected to Firebase project:", PROJECT_ID or "default")
+        print("[Firestore] Connected via service account")
     except Exception as ex:
         print(f"[Firestore] Init failed ({ex}) — using in-memory fallback")
+
+
+# ── Timeout wrapper ───────────────────────────────────────────────────────────
+
+def _run_with_timeout(fn, *args, timeout: float = 5.0):
+    """Run *fn* in a thread; return None if it exceeds *timeout* seconds."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn, *args)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            print(f"[Firestore] Timeout after {timeout}s — returning fallback")
+            return None
+        except Exception as ex:
+            print(f"[Firestore] Error in threaded call: {ex}")
+            return None
 
 
 # ── Generic CRUD ──────────────────────────────────────────────────────────────
@@ -71,7 +90,9 @@ def _set(collection: str, doc_id: str, data: dict):
     _init_firebase()
     data["_updated_at"] = time.time()
     if _USE_FIREBASE:
-        _db.collection(collection).document(doc_id).set(data, merge=True)
+        def _do():
+            _db.collection(collection).document(doc_id).set(data, merge=True)
+        _run_with_timeout(_do)
     else:
         _fallback.setdefault(collection, {})[doc_id] = data
 
@@ -79,18 +100,27 @@ def _set(collection: str, doc_id: str, data: dict):
 def _get(collection: str, doc_id: str) -> Optional[dict]:
     _init_firebase()
     if _USE_FIREBASE:
-        doc = _db.collection(collection).document(doc_id).get()
-        return doc.to_dict() if doc.exists else None
+        def _do():
+            doc = _db.collection(collection).document(doc_id).get()
+            return doc.to_dict() if doc.exists else None
+        result = _run_with_timeout(_do)
+        return result  # None on timeout → treated as missing
     return _fallback.get(collection, {}).get(doc_id)
 
 
 def _list(collection: str, limit: int = 20) -> list[dict]:
     _init_firebase()
     if _USE_FIREBASE:
-        docs = _db.collection(collection).order_by(
-            "_updated_at", direction="DESCENDING"
-        ).limit(limit).stream()
-        return [d.to_dict() for d in docs]
+        def _do():
+            docs = (
+                _db.collection(collection)
+                .order_by("_updated_at", direction="DESCENDING")
+                .limit(limit)
+                .stream()
+            )
+            return [d.to_dict() for d in docs]
+        result = _run_with_timeout(_do)
+        return result if result is not None else []
     col = _fallback.get(collection, {})
     items = list(col.values())
     items.sort(key=lambda x: x.get("_updated_at", 0), reverse=True)
@@ -100,8 +130,11 @@ def _list(collection: str, limit: int = 20) -> list[dict]:
 def _delete(collection: str, doc_id: str) -> bool:
     _init_firebase()
     if _USE_FIREBASE:
-        _db.collection(collection).document(doc_id).delete()
-        return True
+        def _do():
+            _db.collection(collection).document(doc_id).delete()
+            return True
+        result = _run_with_timeout(_do)
+        return bool(result)
     col = _fallback.get(collection, {})
     if doc_id in col:
         del col[doc_id]
@@ -113,14 +146,9 @@ def _delete(collection: str, doc_id: str) -> bool:
 
 COLLECTION_MEDIA = "media_assets"
 
-def store_media_record(media_id: str, record: dict):
-    """
-    Store or update a media asset record.
 
-    Expected fields (all optional except media_id):
-      owner, title, filename, media_type, phash, content_hash,
-      file_size, watermark_key, uploaded_at
-    """
+def store_media_record(media_id: str, record: dict):
+    """Store or update a media asset record."""
     record["media_id"] = media_id
     if "uploaded_at" not in record:
         record["uploaded_at"] = time.time()
@@ -134,7 +162,7 @@ def get_media_record(media_id: str) -> Optional[dict]:
 
 
 def list_media_records(limit: int = 20) -> list[dict]:
-    """List recent media asset records."""
+    """List recent media asset records (with timeout guard)."""
     return _list(COLLECTION_MEDIA, limit)
 
 
@@ -148,18 +176,21 @@ def update_media_watermark(media_id: str, watermark_key: str, status: str):
 
 def search_by_phash(phash: str, limit: int = 10) -> list[dict]:
     """
-    Search media records by pHash value.
-    NOTE: Firestore doesn't support fuzzy search; this is an exact lookup.
-    For fuzzy pHash search, iterate and compute Hamming distance in-memory.
+    Search media records by exact pHash value.
+    For fuzzy search, iterate results and compute Hamming distance in-memory.
     """
     _init_firebase()
     if _USE_FIREBASE:
-        docs = _db.collection(COLLECTION_MEDIA)\
-            .where("phash", "==", phash)\
-            .limit(limit)\
-            .stream()
-        return [d.to_dict() for d in docs]
-    # Fallback: scan in memory
+        def _do():
+            docs = (
+                _db.collection(COLLECTION_MEDIA)
+                .where("phash", "==", phash)
+                .limit(limit)
+                .stream()
+            )
+            return [d.to_dict() for d in docs]
+        result = _run_with_timeout(_do)
+        return result if result is not None else []
     col = _fallback.get(COLLECTION_MEDIA, {})
     return [v for v in col.values() if v.get("phash") == phash][:limit]
 
@@ -168,13 +199,15 @@ def search_by_content_hash(content_hash: str) -> Optional[dict]:
     """Find exact duplicate by SHA-256 content hash."""
     _init_firebase()
     if _USE_FIREBASE:
-        docs = list(
-            _db.collection(COLLECTION_MEDIA)
-            .where("content_hash", "==", content_hash)
-            .limit(1)
-            .stream()
-        )
-        return docs[0].to_dict() if docs else None
+        def _do():
+            docs = list(
+                _db.collection(COLLECTION_MEDIA)
+                .where("content_hash", "==", content_hash)
+                .limit(1)
+                .stream()
+            )
+            return docs[0].to_dict() if docs else None
+        return _run_with_timeout(_do)
     col = _fallback.get(COLLECTION_MEDIA, {})
     for v in col.values():
         if v.get("content_hash") == content_hash:
@@ -186,9 +219,9 @@ def search_by_content_hash(content_hash: str) -> Optional[dict]:
 
 COLLECTION_COMPARISONS = "comparisons"
 
+
 def log_comparison(media_id_1: str, media_id_2: str, result: dict):
     """Log a comparison result to Firestore."""
-    import uuid
     comp_id = str(uuid.uuid4())
     record = {
         "comparison_id": comp_id,
@@ -205,11 +238,16 @@ def get_comparison_history(media_id: str, limit: int = 10) -> list[dict]:
     """Retrieve comparison history for a specific media asset."""
     _init_firebase()
     if _USE_FIREBASE:
-        docs = _db.collection(COLLECTION_COMPARISONS)\
-            .where("media_id_1", "==", media_id)\
-            .limit(limit)\
-            .stream()
-        return [d.to_dict() for d in docs]
+        def _do():
+            docs = (
+                _db.collection(COLLECTION_COMPARISONS)
+                .where("media_id_1", "==", media_id)
+                .limit(limit)
+                .stream()
+            )
+            return [d.to_dict() for d in docs]
+        result = _run_with_timeout(_do)
+        return result if result is not None else []
     col = _fallback.get(COLLECTION_COMPARISONS, {})
     results = [v for v in col.values() if v.get("media_id_1") == media_id]
     return sorted(results, key=lambda x: x.get("timestamp", 0), reverse=True)[:limit]
@@ -219,9 +257,9 @@ def get_comparison_history(media_id: str, limit: int = 10) -> list[dict]:
 
 COLLECTION_SCANS = "scan_results"
 
+
 def log_scan(reference_id: str, scan_results: list[dict]):
     """Log auto-scanner results to Firestore."""
-    import uuid
     scan_id = str(uuid.uuid4())
     record = {
         "scan_id": scan_id,
@@ -230,8 +268,8 @@ def log_scan(reference_id: str, scan_results: list[dict]):
         "results_count": len(scan_results),
         "results": scan_results,
         "violations_found": sum(
-            1 for r in scan_results if r.get("verdict") in
-            {"UNAUTHORIZED_USE_DETECTED", "LIKELY_UNAUTHORIZED"}
+            1 for r in scan_results
+            if r.get("verdict") in {"UNAUTHORIZED_USE_DETECTED", "LIKELY_UNAUTHORIZED"}
         ),
     }
     _set(COLLECTION_SCANS, scan_id, record)
@@ -242,9 +280,10 @@ def list_scan_results(limit: int = 10) -> list[dict]:
     return _list(COLLECTION_SCANS, limit)
 
 
-# ── Ownership Blockchain Simulation ──────────────────────────────────────────
+# ── Ownership Blockchain Simulation ───────────────────────────────────────────
 
 COLLECTION_OWNERSHIP = "ownership_chain"
+
 
 def register_ownership(media_id: str, owner: str, content_hash: str, phash: str):
     """
@@ -252,7 +291,6 @@ def register_ownership(media_id: str, owner: str, content_hash: str, phash: str)
     In production this would write to an actual blockchain/ledger.
     """
     import hashlib
-    # Chain hash: hash of (prev_hash + content_hash + timestamp)
     prev_record = _get(COLLECTION_OWNERSHIP, "LATEST")
     prev_hash = prev_record.get("block_hash", "GENESIS") if prev_record else "GENESIS"
     timestamp = time.time()
@@ -279,7 +317,11 @@ def verify_ownership(media_id: str, claimed_owner: str) -> dict:
     if record is None:
         return {"verified": False, "reason": "No ownership record found"}
     if record.get("owner") == claimed_owner:
-        return {"verified": True, "registered_owner": claimed_owner, "block_hash": record.get("block_hash")}
+        return {
+            "verified": True,
+            "registered_owner": claimed_owner,
+            "block_hash": record.get("block_hash"),
+        }
     return {
         "verified": False,
         "registered_owner": record.get("owner"),
@@ -288,7 +330,7 @@ def verify_ownership(media_id: str, claimed_owner: str) -> dict:
     }
 
 
-# ── Export Fallback State (for debugging) ────────────────────────────────────
+# ── Debug helpers ─────────────────────────────────────────────────────────────
 
 def dump_fallback_state() -> dict:
     """Return the entire in-memory state (for debugging/testing)."""

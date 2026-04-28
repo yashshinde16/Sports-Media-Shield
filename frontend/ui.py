@@ -1,22 +1,17 @@
-"""
-member1_ui.py — Streamlit Frontend Dashboard
-Team Member 1 | Part 4: Frontend + Automation
-
-Full-featured sports media asset protection UI with:
-  - Manual upload & compare mode
-  - Auto-scanner mode
-  - Blockchain ownership registry
-  - Result visualization
-"""
 
 import sys
 import os
 from pathlib import Path
-
+import json, tempfile
 import streamlit as st
 import numpy as np
 import cv2
-
+if "firebase" in st.secrets and "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+    creds = dict(st.secrets["firebase"])
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(creds, tmp)
+    tmp.close()
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
 # ── Path setup ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
 for part in ["ai_engine", "backend_cloud", "ai_services", "frontend"]:
@@ -545,10 +540,11 @@ elif "Status" in mode:
         else:
             st.info("No Firestore records yet (using in-memory fallback).")
     except ImportError as e:
-        st.warning(f"⚠️ firestore module not found: {e}")
+     st.warning(f"⚠️ Firestore module not found: {e}")
+     records = []
     except Exception as e:
-        st.warning(f"⚠️ Firestore unavailable: {e}")
-        import traceback; st.code(traceback.format_exc())
+     st.warning("⚠️ Firestore unavailable — running in offline mode.")
+     records = []
 
     # ── Upload dir check ───────────────────────────────────────────────────
     st.divider()
