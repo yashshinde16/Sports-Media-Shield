@@ -190,9 +190,9 @@ if "Manual" in mode:
         # Display images
         img_col1, img_col2 = st.columns(2)
         with img_col1:
-            st.image(bgr_to_rgb(ref_img), caption="Reference", width='stretch')
+            st.image(bgr_to_rgb(ref_img), caption="Reference", use_column_width=True)
         with img_col2:
-            st.image(bgr_to_rgb(sus_img), caption="Suspect", width='stretch')
+            st.image(bgr_to_rgb(sus_img), caption="Suspect", use_column_width=True)
 
         if st.button("🚀 Run AI Detection", type="primary"):
             with st.spinner("Running AI analysis pipeline..."):
