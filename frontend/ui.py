@@ -405,8 +405,13 @@ elif "Ownership" in mode:
                 _UPLOAD_DIR.mkdir(exist_ok=True)
                 _media_id = result["media_id"]
                 _ext = _Path(reg_file.name).suffix.lower() or ".jpg"
+                if _ext not in [".jpg", ".jpeg", ".png", ".bmp"]:
+                    _ext = ".jpg"  # force a safe default
 
                 # Save original
+                _orig_path = _UPLOAD_DIR / f"{_media_id}_original{_ext}"
+                if not cv2.imwrite(str(_orig_path), img):
+                    raise RuntimeError(f"cv2.imwrite failed for {_orig_path}")# Save original
                 _orig_path = _UPLOAD_DIR / f"{_media_id}_original{_ext}"
                 cv2.imwrite(str(_orig_path), img)
 
@@ -416,7 +421,8 @@ elif "Ownership" in mode:
                         from ai_services.gemini import embed_watermark
                         _wm_img = embed_watermark(img, reg_key)
                         _wm_path = _UPLOAD_DIR / f"{_media_id}_watermarked{_ext}"
-                        cv2.imwrite(str(_wm_path), _wm_img)
+                        if not cv2.imwrite(str(_wm_path), _wm_img):
+                         raise RuntimeError(f"cv2.imwrite failed for {_wm_path}")
                         st.success(f"✅ Asset registered + watermarked!")
                         st.info(f"📁 uploads/{_media_id}_original{_ext}")
                         st.info(f"📁 uploads/{_media_id}_watermarked{_ext}")
