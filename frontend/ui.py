@@ -1,4 +1,3 @@
-
 import sys
 import os
 from pathlib import Path
@@ -6,19 +5,23 @@ import json, tempfile
 import streamlit as st
 import numpy as np
 import cv2
+
 if "firebase" in st.secrets and "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
     creds = dict(st.secrets["firebase"])
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
     json.dump(creds, tmp)
     tmp.close()
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
+
 # ── Path setup ────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
 for part in ["ai_engine", "backend_cloud", "ai_services", "frontend"]:
     sys.path.insert(0, str(BASE_DIR / part))
 sys.path.insert(0, str(BASE_DIR))
 
-UPLOAD_DIR = BASE_DIR / "uploads"
+# NOTE: UPLOAD_DIR is kept as a temp scratch space for intermediate processing
+# only — files here are NOT persisted. All permanent storage goes to Firebase.
+UPLOAD_DIR = Path(tempfile.gettempdir()) / "sports_media_shield_scratch"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 # ── Page Config ───────────────────────────────────────────────────────────────
@@ -118,6 +121,225 @@ with st.sidebar:
 watermark_key = ""
 run_gemini = True
 
+# ── Firebase Storage helpers ──────────────────────────────────────────────────
+
+def _get_firebase_bucket():
+    """Return a firebase_admin storage bucket, initialising the app if needed."""
+    import firebase_admin
+    from firebase_admin import credentials as fb_creds, storage as fb_storage
+
+    if not firebase_admin._apps:
+        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+        project_id = os.environ.get("FIREBASE_PROJECT_ID", "")
+        bucket_name = os.environ.get("FIREBASE_STORAGE_BUCKET", f"{project_id}.appspot.com")
+
+        if not cred_path:
+            raise RuntimeError(
+                "GOOGLE_APPLICATION_CREDENTIALS env var not set. "
+                "Add firebase credentials to st.secrets['firebase']."
+            )
+
+        cred = fb_creds.Certificate(cred_path)
+        firebase_admin.initialize_app(cred, {"storageBucket": bucket_name})
+
+    return fb_storage.bucket()
+
+
+def firebase_upload_image(img: np.ndarray, blob_path: str) -> str:
+    """
+    Encode `img` (BGR numpy array) as JPEG and upload to Firebase Storage.
+
+    Args:
+        img:       BGR numpy image.
+        blob_path: Destination path inside the bucket, e.g.
+                   "uploads/<media_id>_original.jpg"
+
+    Returns:
+        Public download URL (with long-lived signed token).
+    """
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    bucket = _get_firebase_bucket()
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(buf.tobytes(), content_type="image/jpeg")
+    blob.make_public()
+    return blob.public_url
+
+
+def firebase_upload_bytes(data: bytes, blob_path: str, content_type: str = "application/octet-stream") -> str:
+    """Upload raw bytes to Firebase Storage and return a public URL."""
+    bucket = _get_firebase_bucket()
+    blob = bucket.blob(blob_path)
+    blob.upload_from_string(data, content_type=content_type)
+    blob.make_public()
+    return blob.public_url
+
+
+def firebase_download_json(blob_path: str) -> list | dict | None:
+    """Download and parse a JSON blob from Firebase Storage. Returns None if missing."""
+    try:
+        bucket = _get_firebase_bucket()
+        blob = bucket.blob(blob_path)
+        if not blob.exists():
+            return None
+        raw = blob.download_as_bytes()
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def firebase_upload_json(data, blob_path: str) -> None:
+    """Serialise `data` to JSON and upload to Firebase Storage."""
+    raw = json.dumps(data, indent=2).encode("utf-8")
+    firebase_upload_bytes(raw, blob_path, content_type="application/json")
+
+
+def firebase_list_blobs(prefix: str) -> list[dict]:
+    """
+    List blobs under `prefix` in Firebase Storage.
+
+    Returns a list of dicts with keys: name, size, updated, public_url.
+    """
+    bucket = _get_firebase_bucket()
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    result = []
+    for b in blobs:
+        b.make_public()
+        result.append({
+            "name":       b.name,
+            "size":       b.size or 0,
+            "updated":    b.updated.isoformat() if b.updated else "",
+            "public_url": b.public_url,
+        })
+    return result
+
+
+# ── Blockchain chain persistence via Firebase Storage ─────────────────────────
+
+CHAIN_BLOB_PATH = "blockchain/ownership_chain.json"
+
+
+def load_chain_from_firebase() -> list:
+    """Load the ownership chain JSON from Firebase Storage."""
+    data = firebase_download_json(CHAIN_BLOB_PATH)
+    return data if isinstance(data, list) else []
+
+
+def save_chain_to_firebase(chain: list) -> None:
+    """Persist the ownership chain JSON to Firebase Storage."""
+    firebase_upload_json(chain, CHAIN_BLOB_PATH)
+
+
+# ── Patched BlockchainRegistry that uses Firebase instead of local disk ───────
+
+def _get_firebase_registry():
+    """
+    Return a BlockchainRegistry whose _load / _save methods are wired
+    to Firebase Storage so the chain survives Streamlit Cloud restarts.
+    """
+    from blockchain import BlockchainRegistry, Block
+
+    class FirebaseBlockchainRegistry(BlockchainRegistry):
+        """Subclass that persists the chain to Firebase Storage."""
+
+        def __init__(self):
+            # Skip parent __init__ to avoid touching the local filesystem
+            self._chain: list[Block] = []
+            self._load()
+
+        def _load(self):
+            """Load chain from Firebase Storage → Firestore → genesis."""
+            raw = load_chain_from_firebase()
+            if raw:
+                try:
+                    self._chain = [Block.from_dict(b) for b in raw]
+                    return
+                except Exception as exc:
+                    st.warning(f"[Blockchain] Firebase chain parse error: {exc}")
+
+            # Fallback: Firestore
+            try:
+                from backend_cloud.firestore import _list
+                records = _list("blockchain_blocks", limit=1000)
+                if records:
+                    records = [r for r in records if r.get("media_id") != "genesis" or r.get("index") == 0]
+                    records.sort(key=lambda x: x.get("index", 0))
+                    self._chain = [Block.from_dict(b) for b in records]
+                    self._save()
+                    return
+            except Exception:
+                pass
+
+            # Fresh genesis
+            genesis = self._create_genesis()
+            self._chain = [genesis]
+            self._save()
+
+        def _save(self):
+            """Persist chain to Firebase Storage (primary) and Firestore (sync)."""
+            try:
+                save_chain_to_firebase([b.to_dict() for b in self._chain])
+            except Exception as exc:
+                st.warning(f"[Blockchain] Could not save chain to Firebase: {exc}")
+
+            # Also mirror to Firestore for query capability
+            try:
+                from backend_cloud.firestore import _set
+                for b in self._chain:
+                    _set("blockchain_blocks", str(b.index), b.to_dict())
+            except Exception:
+                pass
+
+    return FirebaseBlockchainRegistry()
+
+
+# Session-scoped registry cache
+if "firebase_registry" not in st.session_state:
+    st.session_state["firebase_registry"] = None
+
+
+def _get_registry():
+    if st.session_state["firebase_registry"] is None:
+        st.session_state["firebase_registry"] = _get_firebase_registry()
+    return st.session_state["firebase_registry"]
+
+
+def register_asset_firebase(img, owner, title, watermark_key="", media_id=None):
+    """Register an asset using the Firebase-backed registry."""
+    from blockchain import register_asset as _orig_register
+    import uuid as _uuid
+
+    reg = _get_registry()
+    block = reg.register(
+        img, owner, title, watermark_key,
+        media_id=media_id or str(_uuid.uuid4())
+    )
+    from datetime import datetime, timezone
+    return {
+        "media_id":          block.media_id,
+        "title":             block.title,
+        "owner":             block.owner,
+        "block_index":       block.index,
+        "block_hash":        block.block_hash,
+        "content_hash":      block.content_hash,
+        "phash":             block.phash,
+        "watermark_secured": block.watermark_key_hash != "0" * 64,
+        "registered_at":     datetime.fromtimestamp(block.timestamp, tz=timezone.utc).isoformat(),
+        "chain_length":      len(reg._chain),
+        "merkle_root":       reg.merkle_root(),
+    }
+
+
+def verify_asset_firebase(media_id, claimed_owner=None, img=None):
+    reg = _get_registry()
+    result = reg.verify(media_id, claimed_owner, img)
+    return result.to_dict()
+
+
+def list_registry_firebase(skip_genesis=True):
+    reg = _get_registry()
+    return reg.list_assets(skip_genesis=skip_genesis)
+
+
 # ── Helper: load image from uploaded file ─────────────────────────────────────
 def load_uploaded_image(uploaded_file) -> np.ndarray:
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
@@ -143,9 +365,9 @@ def render_score_gauge(score: float, label: str, color: str = "#6366f1"):
 def verdict_color(verdict: str) -> str:
     return {
         "UNAUTHORIZED_USE_DETECTED": "#ef4444",
-        "LIKELY_UNAUTHORIZED": "#f97316",
-        "POSSIBLE_MATCH": "#eab308",
-        "NO_MATCH": "#22c55e",
+        "LIKELY_UNAUTHORIZED":       "#f97316",
+        "POSSIBLE_MATCH":            "#eab308",
+        "NO_MATCH":                  "#22c55e",
     }.get(verdict, "#6b7280")
 
 
@@ -156,7 +378,6 @@ def verdict_color(verdict: str) -> str:
 if "Manual" in mode:
     st.markdown("## 🔍 Manual Asset Comparison")
 
-    # ── Detection Settings (inside this mode only) ────────────────────────
     with st.expander("⚙️ Detection Settings", expanded=True):
         det_col1, det_col2 = st.columns(2)
         with det_col1:
@@ -187,7 +408,6 @@ if "Manual" in mode:
         ref_img = load_uploaded_image(ref_file)
         sus_img = load_uploaded_image(sus_file)
 
-        # Display images
         img_col1, img_col2 = st.columns(2)
         with img_col1:
             st.image(bgr_to_rgb(ref_img), caption="Reference", use_column_width=True)
@@ -197,7 +417,6 @@ if "Manual" in mode:
         if st.button("🚀 Run AI Detection", type="primary"):
             with st.spinner("Running AI analysis pipeline..."):
                 try:
-                    # Embed watermark if requested
                     if embed_wm and watermark_key:
                         from ai_services.gemini import embed_watermark
                         ref_wm = embed_watermark(ref_img, watermark_key)
@@ -212,7 +431,6 @@ if "Manual" in mode:
                         run_gemini=run_gemini,
                     )
 
-                    # ── Results ───────────────────────────────────────────────
                     st.divider()
                     sim = report.get("similarity", {})
                     verdict = sim.get("verdict", "UNKNOWN")
@@ -225,7 +443,6 @@ if "Manual" in mode:
                     </h2>
                     """, unsafe_allow_html=True)
 
-                    # Score cards
                     c1, c2, c3, c4, c5 = st.columns(5)
                     with c1: render_score_gauge(score, "FINAL SCORE", color)
                     with c2: render_score_gauge(report["phash"].get("similarity",0), "pHASH")
@@ -233,7 +450,6 @@ if "Manual" in mode:
                     with c4: render_score_gauge(report["watermark"].get("match_score",0), "WATERMARK")
                     with c5: render_score_gauge(report["quality"].get("overall_quality",1), "QUALITY")
 
-                    # Flags
                     flags = sim.get("flags", [])
                     if flags:
                         st.markdown("**🚩 Flags Detected:**")
@@ -242,7 +458,6 @@ if "Manual" in mode:
 
                     st.divider()
 
-                    # Detail tabs
                     tab1, tab2, tab3 = st.tabs(["🤖 AI Explanation", "📊 Detailed Scores", "🔧 Technical"])
 
                     with tab1:
@@ -268,13 +483,12 @@ if "Manual" in mode:
 
                     with tab3:
                         st.json({
-                            "phash": report.get("phash", {}),
-                            "orb": report.get("orb", {}),
+                            "phash":     report.get("phash", {}),
+                            "orb":       report.get("orb", {}),
                             "watermark": report.get("watermark", {}),
-                            "errors": report.get("errors", []),
+                            "errors":    report.get("errors", []),
                         })
 
-                    # Store to Firestore
                     try:
                         from backend_cloud.firestore import log_comparison
                         log_comparison("manual_ref", "manual_suspect", sim)
@@ -339,7 +553,6 @@ elif "Auto" in mode:
 
         st.success(f"Scan complete! {results.total} URLs analysed.")
 
-        # Summary metrics — results is a ScanBatchReport; use .records for iteration
         violations = sum(1 for r in results.records if r.is_unauthorized)
         avg_score = sum(r.final_score for r in results.records) / max(results.total, 1)
         m1, m2, m3 = st.columns(3)
@@ -370,12 +583,12 @@ elif "Auto" in mode:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# MODE 3: OWNERSHIP REGISTRY
+# MODE 3: OWNERSHIP REGISTRY  (now backed by Firebase Storage)
 # ════════════════════════════════════════════════════════════════════════════
 
 elif "Ownership" in mode:
-    from blockchain import register_asset, verify_asset, list_registry
     st.markdown("## ⛓️ Blockchain-Style Ownership Registry")
+    st.caption("🔥 Chain persisted to **Firebase Storage** — survives restarts & redeployments.")
 
     tab_reg, tab_ver, tab_list = st.tabs(["📝 Register Asset", "✅ Verify Ownership", "📋 View Registry"])
 
@@ -386,7 +599,12 @@ elif "Ownership" in mode:
             reg_file = st.file_uploader("Asset Image", type=["jpg","jpeg","png"], key="reg_img")
             reg_title = st.text_input("Asset Title", value="Championship Highlights 2024", key="reg_title")
             reg_owner = st.text_input("Owner Name", value=owner_name, key="reg_owner")
-            reg_key = st.text_input("🔑 Watermark Key", value="", type="password", placeholder="Enter secret key to embed watermark...", help="Remember this key — you need it to verify ownership later", key="reg_wm_key")
+            reg_key = st.text_input(
+                "🔑 Watermark Key", value="", type="password",
+                placeholder="Enter secret key to embed watermark...",
+                help="Remember this key — you need it to verify ownership later",
+                key="reg_wm_key"
+            )
         with col2:
             if reg_file:
                 img = load_uploaded_image(reg_file)
@@ -394,48 +612,38 @@ elif "Ownership" in mode:
 
         if reg_file and st.button("⛓️ Register Asset", type="primary"):
             img = load_uploaded_image(reg_file)
-            with st.spinner("Registering on blockchain..."):
-                result = register_asset(img, reg_owner, reg_title, reg_key)
-
-            # Save files to uploads/
-            try:
-                import cv2
-                from pathlib import Path as _Path
-                _UPLOAD_DIR = _Path(__file__).resolve().parent.parent / "uploads"
-                _UPLOAD_DIR.mkdir(exist_ok=True)
+            with st.spinner("Registering on blockchain + uploading to Firebase Storage..."):
+                # 1. Register on the Firebase-backed blockchain
+                result = register_asset_firebase(img, reg_owner, reg_title, reg_key)
                 _media_id = result["media_id"]
-                _ext = _Path(reg_file.name).suffix.lower() or ".jpg"
-                if _ext not in [".jpg", ".jpeg", ".png", ".bmp"]:
-                    _ext = ".jpg"  # force a safe default
+                _ext = ".jpg"  # always store as JPEG in Firebase
 
-                # Save original
-                _orig_path = _UPLOAD_DIR / f"{_media_id}_original{_ext}"
-                if not cv2.imwrite(str(_orig_path), img):
-                    raise RuntimeError(f"cv2.imwrite failed for {_orig_path}")# Save original
-                _orig_path = _UPLOAD_DIR / f"{_media_id}_original{_ext}"
-                cv2.imwrite(str(_orig_path), img)
+                # 2. Upload original image to Firebase Storage
+                try:
+                    orig_url = firebase_upload_image(
+                        img,
+                        f"uploads/{_media_id}_original{_ext}"
+                    )
+                    result["original_url"] = orig_url
+                    st.success("✅ Asset registered + original uploaded to Firebase!")
+                    st.markdown(f"🔗 [View original]({orig_url})")
+                except Exception as _e:
+                    st.success("✅ Asset registered!")
+                    st.warning(f"Could not upload original to Firebase Storage: {_e}")
 
-                # Save watermarked
+                # 3. Upload watermarked image (if key provided)
                 if reg_key:
                     try:
                         from ai_services.gemini import embed_watermark
                         _wm_img = embed_watermark(img, reg_key)
-                        _wm_path = _UPLOAD_DIR / f"{_media_id}_watermarked{_ext}"
-                        if not cv2.imwrite(str(_wm_path), _wm_img):
-                         raise RuntimeError(f"cv2.imwrite failed for {_wm_path}")
-                        st.success(f"✅ Asset registered + watermarked!")
-                        st.info(f"📁 uploads/{_media_id}_original{_ext}")
-                        st.info(f"📁 uploads/{_media_id}_watermarked{_ext}")
+                        wm_url = firebase_upload_image(
+                            _wm_img,
+                            f"uploads/{_media_id}_watermarked{_ext}"
+                        )
+                        result["watermarked_url"] = wm_url
+                        st.markdown(f"🔗 [View watermarked]({wm_url})")
                     except Exception as _e:
-                        st.success("✅ Asset registered!")
-                        st.warning(f"Watermark embed failed: {_e}")
-                else:
-                    st.success("✅ Asset registered!")
-                    st.info(f"📁 uploads/{_media_id}_original{_ext}")
-
-            except Exception as _save_err:
-                st.success("✅ Asset registered!")
-                st.warning(f"Could not save to uploads/: {_save_err}")
+                        st.warning(f"Watermark embed/upload failed: {_e}")
 
             st.json(result)
 
@@ -444,7 +652,7 @@ elif "Ownership" in mode:
         ver_id = st.text_input("Media ID")
         ver_owner = st.text_input("Claimed Owner")
         if st.button("🔍 Verify") and ver_id:
-            result = verify_asset(ver_id, ver_owner)
+            result = verify_asset_firebase(ver_id, ver_owner)
             if result.get("verified"):
                 st.success(f"✅ Ownership verified for: {ver_owner}")
             else:
@@ -453,10 +661,29 @@ elif "Ownership" in mode:
 
     with tab_list:
         st.markdown("### Registered Assets")
-        registry = list_registry()
+        if st.button("🔄 Refresh Registry"):
+            # Force reload from Firebase
+            st.session_state["firebase_registry"] = None
+        registry = list_registry_firebase()
         if registry:
             for entry in registry:
                 with st.expander(f"📦 {entry.get('title','Unknown')} — {entry.get('owner','?')}"):
+                    # Show Firebase Storage links if available
+                    mid = entry.get("media_id", "")
+                    orig_blob = f"uploads/{mid}_original.jpg"
+                    wm_blob   = f"uploads/{mid}_watermarked.jpg"
+                    try:
+                        bucket = _get_firebase_bucket()
+                        if bucket.blob(orig_blob).exists():
+                            b = bucket.blob(orig_blob)
+                            b.make_public()
+                            st.markdown(f"🔗 [Original image]({b.public_url})")
+                        if bucket.blob(wm_blob).exists():
+                            b = bucket.blob(wm_blob)
+                            b.make_public()
+                            st.markdown(f"🔗 [Watermarked image]({b.public_url})")
+                    except Exception:
+                        pass
                     st.json(entry)
         else:
             st.info("No assets registered yet.")
@@ -487,26 +714,43 @@ elif "Status" in mode:
     # ── Environment Variables ──────────────────────────────────────────────
     st.divider()
     st.markdown("### 🔑 Environment Variables")
-    for var in ["GEMINI_API_KEY", "FIREBASE_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS"]:
+    for var in ["GEMINI_API_KEY", "FIREBASE_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS", "FIREBASE_STORAGE_BUCKET"]:
         val = os.environ.get(var, "")
         if val:
             st.markdown(f"✅ `{var}` — set ({len(val)} chars)")
         else:
             st.markdown(f"❌ `{var}` — **not set**")
 
-    # ── Recent Uploads ─────────────────────────────────────────────────────
+    # ── Firebase Storage Files ────────────────────────────────────────────
     st.divider()
-    st.markdown("### 📁 Recent Uploads")
+    st.markdown("### 🔥 Firebase Storage — Recent Uploads")
     try:
-        from backend_cloud.storage import list_files
-        files = list_files(limit=10)
-        if files:
-            for f in files:
-                st.markdown(f"- `{f['filename']}` ({f.get('size_bytes', 0)//1024}KB) — `{f['media_id'][:8]}…`")
+        blobs = firebase_list_blobs("uploads/")
+        if blobs:
+            # Sort newest first by name (UUIDs are time-based)
+            for b in sorted(blobs, key=lambda x: x["updated"], reverse=True)[:10]:
+                kb = b["size"] // 1024
+                name = b["name"].replace("uploads/", "")
+                st.markdown(f"- `{name}` ({kb} KB) — [view]({b['public_url']})")
         else:
-            st.info("No files uploaded yet.")
+            st.info("No files in Firebase Storage yet.")
     except Exception as e:
-        st.warning(f"⚠️ Cannot list files: {e}")
+        st.warning(f"⚠️ Cannot list Firebase Storage files: {e}")
+
+    # ── Blockchain Chain Status ────────────────────────────────────────────
+    st.divider()
+    st.markdown("### ⛓️ Blockchain Chain (Firebase Storage)")
+    try:
+        chain_data = firebase_download_json(CHAIN_BLOB_PATH)
+        if chain_data:
+            st.success(f"✅ Chain loaded — **{len(chain_data)} block(s)** found in `{CHAIN_BLOB_PATH}`")
+            if len(chain_data) > 1:
+                latest = chain_data[-1]
+                st.markdown(f"Latest block: `{latest.get('block_hash','?')[:20]}…`  |  owner: **{latest.get('owner','?')}**")
+        else:
+            st.info("No chain stored in Firebase yet (will be created on first registration).")
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch chain from Firebase: {e}")
 
     # ── Firestore Records ──────────────────────────────────────────────────
     st.divider()
@@ -520,18 +764,15 @@ elif "Status" in mode:
             st.info("No Firestore records yet (using in-memory fallback).")
     except ImportError as e:
         st.warning(f"⚠️ Firestore module not found: {e}")
-        records = []
-    except Exception as e:
+    except Exception:
         st.warning("⚠️ Firestore unavailable — running in offline mode.")
-        records = []
 
-    # ── Upload Directory ───────────────────────────────────────────────────
+    # ── Storage Note ───────────────────────────────────────────────────────
     st.divider()
-    st.markdown("### 🗂️ Upload Directory")
-    if UPLOAD_DIR.exists():
-        local_files = list(UPLOAD_DIR.iterdir())
-        st.success(f"✅ `{UPLOAD_DIR}` — {len(local_files)} file(s)")
-        for f in local_files[-5:]:
-            st.markdown(f"- `{f.name}`")
-    else:
-        st.warning(f"Upload directory not found: `{UPLOAD_DIR}`")
+    st.markdown("### 📝 Persistence Note")
+    st.info(
+        "**Streamlit Cloud has no persistent filesystem.** "
+        "This app stores all uploaded images and the ownership chain in "
+        "**Firebase Storage** (`uploads/` and `blockchain/ownership_chain.json`). "
+        "Data survives app restarts, redeployments, and sleep cycles."
+    )

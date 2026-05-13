@@ -140,17 +140,31 @@ class BlockchainRegistry:
     # ── Persistence ──────────────────────────────────────────────────────────
 
     def _load(self):
-        """Load chain from JSON file, or create genesis block if empty."""
-        if self.chain_file.exists():
-            try:
-                with open(self.chain_file, "r") as f:
-                    raw = json.load(f)
-                self._chain = [Block.from_dict(b) for b in raw]
-                return
-            except Exception as e:
-                print(f"[Blockchain] Warning: could not load chain ({e}). Starting fresh.")
+       """Load chain from JSON file, fallback to Firestore, or create genesis."""
+       if self.chain_file.exists():
+        try:
+            with open(self.chain_file, "r") as f:
+                raw = json.load(f)
+            self._chain = [Block.from_dict(b) for b in raw]
+            return
+        except Exception as e:
+            print(f"[Blockchain] Warning: could not load chain ({e}).")
 
-        # No file → initialise with genesis block
+    # Try loading from Firestore
+        try:
+           from backend_cloud.firestore import _list
+           records = _list("blockchain_blocks", limit=1000)
+           if records:
+               records = [r for r in records if r.get("media_id") != "genesis" or r.get("index") == 0]
+               records.sort(key=lambda x: x.get("index", 0))
+               self._chain = [Block.from_dict(b) for b in records]
+               self._save()  # cache locally
+               print(f"[Blockchain] Loaded {len(self._chain)} blocks from Firestore.")
+               return
+        except Exception as e:
+            print(f"[Blockchain] Could not load from Firestore ({e}).")
+
+        # Fresh start
         genesis = self._create_genesis()
         self._chain = [genesis]
         self._save()
@@ -481,12 +495,12 @@ class BlockchainRegistry:
     # ── Firestore Sync (optional) ─────────────────────────────────────────────
 
     def _sync_to_firestore(self, block: Block):
-        """Push block to Firestore — silent fail if unavailable."""
-        try:
-            from backend_cloud.firestore import store_block_record
-            store_block_record(block.media_id, block.to_dict())
-        except Exception:
-            pass   # Graceful: Firestore is optional
+     """Push block to Firestore — silent fail if unavailable."""
+     try:
+          from backend_cloud.firestore import _set
+          _set("blockchain_blocks", str(block.index), block.to_dict())
+     except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
